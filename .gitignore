@@ -1,0 +1,17 @@
+# Аудит-снапшот web-клиента: на GitHub — ТОЛЬКО очищенная выборка (см. AUDIT.md).
+*
+!.gitignore
+!AUDIT.md
+!README.md
+!index.html
+!package.json
+!tsconfig.json
+!vite.config.ts
+!scripts/
+!scripts/**
+!public/
+!public/**
+!src/
+!src/**
+!test/
+!test/**

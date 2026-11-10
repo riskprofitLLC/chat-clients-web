@@ -1,0 +1,153 @@
+/* Токены дизайна: цвета, шкалы, радиусы, тени, движение.
+   Три темы (auto/light/dark) и шесть акцентов — через data-theme/data-accent. */
+:root {
+  /* шкала отступов 4/8 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+
+  /* радиусы */
+  --r-sm: 12px;
+  --r-md: 16px;
+  --r-lg: 22px;
+  --r-full: 999px;
+
+  /* типографика 12/13/15/17/20/28 */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-2xl: 28px;
+
+  /* движение 120/200/280 мс, единый easing */
+  --t-fast: 120ms;
+  --t-base: 200ms;
+  --t-slow: 280ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  /* светлая тема: нейтральная серо-синяя, не чистый белый */
+  --bg: #eef0f4;
+  --bg-elevated: #f7f8fa;
+  --surface: #ffffff;
+  --surface-2: #f1f3f7;
+  --surface-3: #e6e9ef;
+  --text: #171a21;
+  --text-muted: #626b7a;
+  --border: #dfe3ea;
+  --border-strong: #c9d0da;
+  --bubble-theirs: #ffffff;
+  --bubble-mine: #dce8ff;
+  --bubble-mine-text: #10203a;
+  --danger: #d92d20;
+  --danger-soft: #fde8e6;
+  --success: #12805c;
+  --warning: #b45309;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.1), 0 2px 4px rgba(16, 24, 40, 0.06);
+  --shadow-lg: 0 18px 48px rgba(16, 24, 40, 0.18), 0 4px 12px rgba(16, 24, 40, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #12151c;
+    --bg-elevated: #171b24;
+    --surface: #1b202b;
+    --surface-2: #232937;
+    --surface-3: #2c3342;
+    --text: #e7eaf0;
+    --text-muted: #97a1b2;
+    --border: #2b3242;
+    --border-strong: #3a4354;
+    --bubble-theirs: #232937;
+    --bubble-mine: #2b4a7a;
+    --bubble-mine-text: #eaf1ff;
+    --danger: #f97066;
+    --danger-soft: #3a1f1e;
+    --success: #3ecf8e;
+    --warning: #f5b544;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 20px 52px rgba(0, 0, 0, 0.55);
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: #12151c;
+  --bg-elevated: #171b24;
+  --surface: #1b202b;
+  --surface-2: #232937;
+  --surface-3: #2c3342;
+  --text: #e7eaf0;
+  --text-muted: #97a1b2;
+  --border: #2b3242;
+  --border-strong: #3a4354;
+  --bubble-theirs: #232937;
+  --bubble-mine: #2b4a7a;
+  --bubble-mine-text: #eaf1ff;
+  --danger: #f97066;
+  --danger-soft: #3a1f1e;
+  --success: #3ecf8e;
+  --warning: #f5b544;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 20px 52px rgba(0, 0, 0, 0.55);
+}
+
+/* акценты: --accent и производные; текст на акценте всегда контрастный */
+:root,
+:root[data-accent='blue'] {
+  --accent: #2f6df6;
+  --accent-strong: #1f57d6;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='teal'] {
+  --accent: #0f9b8e;
+  --accent-strong: #0b7c72;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='violet'] {
+  --accent: #7c4dff;
+  --accent-strong: #6234e0;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='rose'] {
+  --accent: #e0447c;
+  --accent-strong: #c22e64;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='amber'] {
+  --accent: #c47f10;
+  --accent-strong: #a2670a;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='green'] {
+  --accent: #2f9e44;
+  --accent-strong: #237a34;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 0ms;
+    --t-base: 0ms;
+    --t-slow: 0ms;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

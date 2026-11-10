@@ -1,0 +1,1257 @@
+// Ядро обмена: сборка конверта, fan-out по устройствам, приём с ack-страницами,
+// дедуп, реакции/правки/удаления/закрепы, группы, статусы.
+// Порт data/MessageRepository.kt — та же логика и те же wire-форматы.
+import * as Env from '../protocol/envelope.js'
+import {
+  BioFormat,
+  CallFormat,
+  ContactFormat,
+  DraftFormat,
+  EditFormat,
+  GeoFormat,
+  GroupFormat,
+  MediaJson,
+  PinFormat,
+  PollFormat,
+  ReplyFormat,
+  ReactionFormat,
+  SyncFormat,
+  SystemFormat,
+  VoteFormat,
+  DeleteFormat,
+  type CallEvent,
+  type GroupInfo,
+  type MediaInfo,
+} from '../protocol/formats.js'
+import { parse, type Kind } from '../protocol/codec.js'
+import { refOf, sameRef } from '../protocol/refs.js'
+import { validChatId } from '../protocol/validators.js'
+import { applyDelete, applyEdit } from './journal-ops.js'
+import { buildFeed, type FeedItem } from './feed.js'
+import { aggregateReactions, type ReactionEntry, type ReactionState } from './reactions.js'
+import { aggregateVotes, type PollState, type VoteEntry } from './polls.js'
+import { CallGate, type CallVerdict } from './callgate.js'
+import { DedupIndex } from './dedup.js'
+import { verdict as tofuVerdict } from './tofu.js'
+import { chunkItems, decodeChunk, encodeChunk, type TransferItem } from './transfer.js'
+import { Outbox, type PendingSend } from '../store/outbox.js'
+import { Journal, type MessageRecord } from '../store/journal.js'
+import { CallLogStore, DraftsStore, MarksStore, MediaCache, PinsStore, type CallLogEntry } from '../store/chat-state.js'
+import { ContactsStore } from '../store/contacts.js'
+import { GroupsStore } from '../store/groups.js'
+import { KeysStore } from '../store/keys.js'
+import { ProfilesStore } from '../store/profiles.js'
+import { PrefsStore } from '../store/prefs.js'
+import { WsClient } from '../net/ws.js'
+import { RelayError, type BatchRecipient, type DeviceKey, type RelayApi, type RelayMessage } from '../net/api.js'
+import { SessionInfo, type DeviceKeyPair } from '../app/session.js'
+import type { Kv } from '../store/kv.js'
+
+// смена состава устройств собеседника: отправка блокируется до подтверждения
+export class KeyChangedError extends Error {
+  constructor(
+    readonly peer: string,
+    readonly devices: string[],
+    readonly isNewDevice: boolean,
+  ) {
+    super(`ключи изменились: ${peer}`)
+    this.name = 'KeyChangedError'
+  }
+}
+
+export interface ChatSnapshot {
+  feed: FeedItem[]
+  reactions: Map<string, ReactionState>
+  polls: Map<string, PollState>
+  peerReadAt: number
+  peerDeliveredAt: number
+}
+
+export interface ChatSummary {
+  chatId: string
+  title: string
+  isGroup: boolean
+  group?: GroupInfo
+  lastRecord: MessageRecord | null
+  lastKind: Kind | null
+  lastTs: number
+  unread: number
+  draft: string
+  pinned: string[]
+  typing: boolean
+  members: number
+  profileBio: string
+}
+
+export type MessengerEvent =
+  | { type: 'chat'; chatId: string }
+  | { type: 'typing'; chatId: string }
+  | { type: 'presence'; connected: boolean }
+  | { type: 'call'; from: string; self: boolean; verdict: CallVerdict }
+  | { type: 'keys-changed'; peer: string; devices: string[]; isNewDevice: boolean }
+  | { type: 'error'; message: string }
+
+export interface MessengerDeps {
+  kv: Kv
+  api: RelayApi
+  session: SessionInfo
+  journal: Journal
+  prefs: PrefsStore
+  keys: KeysStore
+  contacts: ContactsStore
+  groups: GroupsStore
+  profiles: ProfilesStore
+  drafts: DraftsStore
+  pins: PinsStore
+  marks: MarksStore
+  media: MediaCache
+  callLog: CallLogStore
+}
+
+const KEY_TTL_MS = 60_000
+const DRAIN_MAX_PAGES = 1024
+const TYPING_THROTTLE_MS = 3_000
+const BATCH_CHUNK = 128
+
+export class Messenger {
+  readonly outbox: Outbox
+  private readonly dedup = new DedupIndex()
+  private readonly callGate = new CallGate()
+  private readonly keyCache = new Map<string, { at: number; devices: DeviceKey[] }>()
+  private readonly typingSent = new Map<string, number>()
+  private readonly typingSeen = new Map<string, number>()
+  private readonly listeners = new Set<(event: MessengerEvent) => void>()
+  private ws: WsClient | null = null
+  private stopped = true
+  private draining = false
+  // wake-сигнал во время дрейна не теряется: после цикла идёт повторный
+  private drainRequested = false
+  private flushing = false
+  private outboxTimer: ReturnType<typeof setInterval> | null = null
+  private typingTimer: ReturnType<typeof setInterval> | null = null
+  // «ядовитые» сообщения: считаем попытки, после лимита — в карантин
+  private readonly poison = new Map<number, number>()
+  private readonly onlineHandler = (): void => void this.onConnectivity()
+  private readonly visibleHandler = (): void => {
+    if (document.visibilityState === 'visible') void this.onConnectivity()
+  }
+
+  constructor(private readonly deps: MessengerDeps) {
+    this.outbox = new Outbox(deps.kv)
+  }
+
+  get session(): SessionInfo {
+    return this.deps.session
+  }
+
+  get prefs(): PrefsStore {
+    return this.deps.prefs
+  }
+
+  get journal(): Journal {
+    return this.deps.journal
+  }
+
+  onEvent(listener: (event: MessengerEvent) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  private emit(event: MessengerEvent): void {
+    for (const listener of this.listeners) listener(event)
+  }
+
+  // ─── жизненный цикл ────────────────────────────────────────────────────
+
+  async start(): Promise<void> {
+    this.stopped = false
+    await this.seedDedup()
+    await this.flushOutbox()
+    await this.drainAll()
+    this.connectWs()
+    // сеть вернулась / вкладка снова на экране — забираем пропущенное
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this.onlineHandler)
+      document.addEventListener('visibilitychange', this.visibleHandler)
+      window.addEventListener('pageshow', this.onlineHandler)
+    }
+    this.outboxTimer = setInterval(() => void this.flushOutbox().catch(() => {}), 15_000)
+    // индикатор «печатает» живёт 5 секунд после сигнала
+    this.typingTimer = setInterval(() => {
+      const now = Date.now()
+      let changed = false
+      for (const [chatId, at] of this.typingSeen) {
+        if (now - at > 5_000) {
+          this.typingSeen.delete(chatId)
+          changed = true
+        }
+      }
+      if (changed) for (const chatId of this.typingSeen.keys()) this.emit({ type: 'typing', chatId })
+    }, 2_000)
+  }
+
+  stop(): void {
+    this.stopped = true
+    this.ws?.close()
+    this.ws = null
+    if (this.outboxTimer) clearInterval(this.outboxTimer)
+    if (this.typingTimer) clearInterval(this.typingTimer)
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this.onlineHandler)
+      document.removeEventListener('visibilitychange', this.visibleHandler)
+      window.removeEventListener('pageshow', this.onlineHandler)
+    }
+  }
+
+  private async onConnectivity(): Promise<void> {
+    if (this.stopped) return
+    // если сокет лежал, переподключаемся немедленно, не ждём backoff
+    this.ws?.reconnectNow()
+    await this.flushOutbox().catch(() => {})
+    await this.drainAll()
+  }
+
+  private connectWs(): void {
+    if (this.stopped) return
+    const url = this.deps.api.wsUrl()
+    this.ws = new WsClient(url, this.deps.session.token, {
+      onSignal: (signal) => void this.onSignal(signal),
+      onState: (connected) => {
+        this.emit({ type: 'presence', connected })
+        // сообщения, пришедшие за время разрыва, забираем сразу
+        if (connected) void this.onConnectivity()
+      },
+      onAuthError: () => this.emit({ type: 'error', message: 'токен отозван — войдите заново' }),
+      checkAuth: async () => {
+        try {
+          await this.deps.api.listDevices(this.deps.session.token)
+          return true
+        } catch (error) {
+          return !(error instanceof RelayError && error.status === 401)
+        }
+      },
+    })
+  }
+
+  private async onSignal(signal: string): Promise<void> {
+    if (signal.startsWith('typing:')) {
+      const from = signal.slice('typing:'.length)
+      this.typingSeen.set(from, Date.now())
+      this.emit({ type: 'typing', chatId: from })
+      return
+    }
+    if (signal.startsWith('delivered:') || signal.startsWith('read:')) {
+      // отметка собеседника: рисуем галочки «доставлено/прочитано»
+      const isRead = signal.startsWith('read:')
+      const peer = isRead ? signal.slice(5) : signal.split(':')[1] ?? ''
+      if (peer) {
+        const now = Date.now()
+        await this.deps.marks.patch(peer, isRead ? { peerReadAt: now, peerDeliveredAt: now } : { peerDeliveredAt: now })
+      }
+      this.emit({ type: 'chat', chatId: peer })
+      return
+    }
+    // "newmsg": забираем очередь
+    await this.drainAll()
+  }
+
+  // ─── приём ─────────────────────────────────────────────────────────────
+
+  // посев дедупа хвостом журнала: после перезапуска уже обработанные блобы
+  // не должны обрабатываться повторно
+  private async seedDedup(): Promise<void> {
+    for (const chatId of await this.deps.journal.chatIds()) {
+      const records = await this.deps.journal.history(chatId, 64)
+      for (const record of records) {
+        // ключ по содержимому: перезапуск не должен снова обработать звонок
+        this.dedup.remember(await this.deps.session.dedupKey(record.from, record.content))
+      }
+    }
+  }
+
+  async drainAll(): Promise<number> {
+    // дрейн уже идёт: сигнал не теряем, а просим повторить цикл
+    if (this.draining) {
+      this.drainRequested = true
+      return 0
+    }
+    this.draining = true
+    let saved = 0
+    try {
+      do {
+        this.drainRequested = false
+        saved += await this.drainOnce()
+      } while (this.drainRequested)
+    } finally {
+      this.draining = false
+    }
+    if (saved > 0) this.emit({ type: 'chat', chatId: '' })
+    return saved
+  }
+
+  private async drainOnce(): Promise<number> {
+    let saved = 0
+    let after = 0
+    let pages = 0
+    while (true) {
+      const page = await this.deps.api.drainPage(this.deps.session.token, after)
+      if (page.messages.length === 0) break
+      const ack: number[] = []
+      for (const message of page.messages) {
+        let handled = false
+        try {
+          if (await this.handleIncoming(message)) saved++
+          handled = true
+        } catch (error) {
+          // одно битое сообщение не должно останавливать дрейн очереди
+          this.emit({ type: 'error', message: `сообщение пропущено: ${(error as Error).message}` })
+          // «ядовитое» сообщение: после лимита попыток уходит в карантин,
+          // иначе очередь навсегда застрянет на нём
+          const attempts = (this.poison.get(message.serverId) ?? 0) + 1
+          this.poison.set(message.serverId, attempts)
+          if (attempts >= 3) {
+            await this.deps.kv.put(`poison:${message.serverId}`, message.blob).catch(() => undefined)
+            handled = true
+          }
+        }
+        // ack ТОЛЬКО после успешной обработки: сбой записи не теряет сообщение
+        if (handled && message.serverId > 0) ack.push(message.serverId)
+      }
+      if (ack.length > 0) {
+        try {
+          await this.deps.api.ackMessages(this.deps.session.token, ack)
+          for (const id of ack) this.poison.delete(id)
+        } catch {
+          // сбой подтверждения не критичен: сервер отдаст снова, дедуп снимет
+        }
+      }
+      if (!page.more) break
+      const last = page.messages[page.messages.length - 1]?.serverId ?? 0
+      if (last <= after || ++pages > DRAIN_MAX_PAGES) break
+      after = last
+    }
+    return saved
+  }
+
+  private async handleIncoming(message: RelayMessage): Promise<boolean> {
+    const blobKey = await this.deps.session.dedupKey(message.from, message.blob)
+    if (this.dedup.seen(blobKey)) return false
+
+    let content: Uint8Array
+    try {
+      content = await this.deps.session.identity.open(message.blob)
+    } catch {
+      // не нам или подделано: молча пропускаем
+      return false
+    }
+
+    // дедуп по содержимому: при ретрае блоб новый (случайный эфемерный ключ),
+    // но расшифрованный контент тот же — иначе получатель видел бы дубли
+    const contentKey = await this.deps.session.dedupKey(message.from, content)
+    if (this.dedup.seen(contentKey)) {
+      this.dedup.remember(blobKey)
+      return false
+    }
+
+    if (message.kind === 'transfer') {
+      // перенос истории принимается ТОЛЬКО от своего логина
+      if (message.from !== this.deps.session.login) return false
+      await this.receiveTransfer(content)
+      this.dedup.remember(blobKey)
+      this.dedup.remember(contentKey)
+      return true
+    }
+
+    const done = await this.routeIncoming(message.from, content)
+    if (done) {
+      this.dedup.remember(blobKey)
+      this.dedup.remember(contentKey)
+    }
+    return done
+  }
+
+  // разбор содержимого: групповой конверт распаковывается ДО ветвления по типу,
+  // иначе правка/удаление/закреп в группе падали в «обычную запись»
+  private async routeIncoming(from: string, content: Uint8Array): Promise<boolean> {
+    const outer = Env.decode(content)
+    let envelope = outer
+    let group: GroupInfo | null = null
+    if (outer?.type === Env.TYPE_GROUP) {
+      const decoded = GroupFormat.decode(outer.payload)
+      if (!decoded) return false
+      group = decoded.group
+      if (!(await this.authorizeGroup(from, group))) return false
+      // envelope — внутренний, но в журнал пишем ИСХОДНЫЙ групповой конверт
+      envelope = Env.decode(decoded.inner)
+    }
+
+    if (envelope) {
+      switch (envelope.type) {
+        case Env.TYPE_CALL: {
+          const event = CallFormat.decode(envelope.payload)
+          if (!event) return false
+          const self = from === this.deps.session.login
+          const verdict = this.callGate.decide(self, event)
+          if (verdict.kind === 'missed') {
+            await this.recordMissedCall(from, event)
+          }
+          this.emit({ type: 'call', from, self, verdict })
+          return true
+        }
+        case Env.TYPE_SYNC: {
+          // копия своего сообщения с другого устройства
+          if (from !== this.deps.session.login) return false
+          const sync = SyncFormat.decode(envelope.payload)
+          if (!sync) return false
+          const innerKey = await this.deps.session.dedupKey(sync.chatId, sync.content)
+          if (this.dedup.remember(innerKey)) return false
+          await this.applySyncedContent(sync.chatId, sync.content)
+          this.emit({ type: 'chat', chatId: sync.chatId })
+          return true
+        }
+        case Env.TYPE_BIO: {
+          const bio = BioFormat.decode(envelope.payload)
+          if (!bio) return false
+          await this.deps.profiles.patch(from, { bio: bio.text, birthday: bio.birthday })
+          this.emit({ type: 'chat', chatId: from })
+          return true
+        }
+        case Env.TYPE_DRAFT: {
+          if (from !== this.deps.session.login) return false
+          const draft = DraftFormat.decode(envelope.payload)
+          if (!draft) return false
+          const existing = await this.deps.drafts.get(draft.chatId)
+          if (!existing || draft.at > existing.at) await this.deps.drafts.set(draft.chatId, draft.text, draft.at)
+          this.emit({ type: 'chat', chatId: draft.chatId })
+          return true
+        }
+        case Env.TYPE_FOLDERS:
+          // папок в web-клиенте нет: событие валидное, но неприменимое
+          return true
+        case Env.TYPE_EDIT: {
+          const edit = EditFormat.decode(envelope.payload)
+          if (!edit) return false
+          const chatId = group?.id ?? from
+          const ok = await applyEdit(this.deps.journal, chatId, from, {
+            targetRef: edit.targetRef,
+            targetTs: edit.targetTs,
+            newContent: edit.newContent,
+          })
+          if (ok) this.emit({ type: 'chat', chatId })
+          return ok
+        }
+        case Env.TYPE_DELETE: {
+          const del = DeleteFormat.decode(envelope.payload)
+          if (!del) return false
+          const chatId = group?.id ?? from
+          const known = await this.deps.groups.get(chatId)
+          const ok = await applyDelete(
+            this.deps.journal,
+            chatId,
+            from,
+            { targetRef: del.targetRef, targetTs: del.targetTs },
+            new Set(known?.admins ?? []),
+          )
+          if (ok) this.emit({ type: 'chat', chatId })
+          return ok
+        }
+        case Env.TYPE_PIN: {
+          const pin = PinFormat.decode(envelope.payload)
+          if (!pin) return false
+          const chatId = group?.id ?? from
+          const refs = await this.deps.pins.get(chatId)
+          const target = pin.targetRef ?? `ts:${pin.targetTs}`
+          const next = pin.pinned
+            ? [...refs.filter((r) => r !== target), target]
+            : refs.filter((r) => r !== target)
+          await this.deps.pins.set(chatId, next)
+          this.emit({ type: 'chat', chatId })
+          return true
+        }
+        default:
+          break
+      }
+    }
+
+    // обычная запись: определяем чат и пишем в журнал
+    const chatId = group?.id ?? from
+    if (group) await this.deps.groups.apply(group)
+    // карточка контакта запоминаем локально: имя показываем в списке чатов
+    const contact = parse(content, false)
+    if (contact.kind === 'content' && contact.content.kind === 'contact' && contact.content.name) {
+      await this.deps.contacts.rename(contact.content.login, contact.content.name)
+    }
+
+    await this.deps.journal.append(chatId, {
+      from,
+      timestamp: Date.now(),
+      content,
+    })
+    await this.markDelivered(from)
+    this.emit({ type: 'chat', chatId })
+    return true
+  }
+
+  // групповой конверт доверяем только участнику; состав/админов меняет
+  // только админ (или создатель при первой ревизии)
+  private async authorizeGroup(from: string, info: GroupInfo): Promise<boolean> {
+    const existing = await this.deps.groups.get(info.id)
+    if (existing) {
+      if (!existing.members.includes(from)) return false
+      // определение применяем только от админа: иначе любой участник
+      // подменил бы состав и права
+      if (existing.admins.includes(from)) return true
+      // участник не админ: сообщение принимаем, но группу не переписываем
+      info.members = existing.members
+      info.admins = existing.admins
+      info.name = existing.name
+      info.desc = existing.desc
+      info.rev = existing.rev
+      return true
+    }
+    // новая группа: отправитель и я обязаны быть в составе, rev=1
+    if (!info.members.includes(from)) return false
+    if (!info.members.includes(this.deps.session.login)) return false
+    if (info.rev !== 1) return false
+    if (info.members.length > 50) return false
+    return true
+  }
+
+  private async markDelivered(from: string): Promise<void> {
+    if (from === this.deps.session.login) return
+    try {
+      await this.deps.api.confirmDelivered(this.deps.session.token, from, this.deps.session.deviceId)
+    } catch {
+      // статус доставки не критичен
+    }
+  }
+
+  // копия своего сообщения с другого устройства
+  private async applySyncedContent(chatId: string, content: Uint8Array): Promise<void> {
+    const group = parse(content).group
+    if (group) await this.deps.groups.apply(group.info)
+    await this.deps.journal.append(chatId, {
+      from: this.deps.session.login,
+      timestamp: Date.now(),
+      content,
+    })
+  }
+
+  private async recordMissedCall(from: string, event: CallEvent): Promise<void> {
+    await this.deps.journal.append(from, {
+      from,
+      timestamp: Date.now(),
+      content: CallFormat.encodeRecord(event.callId, 'missed'),
+    })
+    await this.deps.callLog.add({
+      callId: event.callId,
+      peer: from,
+      outgoing: false,
+      status: 'missed',
+      at: Date.now(),
+      seconds: 0,
+    })
+  }
+
+  // ─── перенос истории ───────────────────────────────────────────────────
+
+  private async receiveTransfer(content: Uint8Array): Promise<void> {
+    const items = decodeChunk(content, this.deps.session.login)
+    for (const item of items) {
+      const group = parse(item.content).group
+      if (group) await this.deps.groups.apply(group.info)
+      // append идемпотентен по (автор, ref): повторный перенос не плодит дубли
+      await this.deps.journal.append(item.chat, {
+        from: item.from,
+        timestamp: item.ts,
+        content: item.content,
+      })
+    }
+    this.emit({ type: 'chat', chatId: '' })
+  }
+
+  // выгрузка своей истории на другое устройство аккаунта
+  async transferHistoryTo(targetDevice: string, onProgress?: (done: number, total: number) => void): Promise<number> {
+    const devices = await this.devicesFor(this.deps.session.login, true)
+    const target = devices.find((d) => d.deviceId === targetDevice)
+    if (!target) throw new RelayError(404, null, 'устройство не привязано к аккаунту')
+    const chatIds = await this.deps.journal.chatIds()
+    const all: TransferItem[] = []
+    for (const chatId of chatIds) {
+      for (const record of await this.deps.journal.history(chatId, Number.MAX_SAFE_INTEGER)) {
+        all.push({ chat: chatId, from: record.from, ts: record.timestamp, content: record.content })
+      }
+    }
+    let done = 0
+    for (const chunk of chunkItems(all)) {
+      const payload = encodeChunk(chunk)
+      const blob = await this.deps.session.identity.seal(target.pubSpki, payload)
+      await this.deps.api.send(this.deps.session.token, this.deps.session.login, 'transfer', [[targetDevice, blob]])
+      done += chunk.length
+      onProgress?.(done, all.length)
+    }
+    return all.length
+  }
+
+  // ─── отправка ──────────────────────────────────────────────────────────
+
+  // получатели контента: для группы — участники кроме меня, иначе собеседник
+  private async recipientsOf(chatId: string): Promise<string[]> {
+    const group = await this.deps.groups.get(chatId)
+    if (group) return group.members.filter((m) => m !== this.deps.session.login)
+    return [chatId]
+  }
+
+  // сброс кэша ключей: после привязки нового устройства пользователь
+  // должен увидеть предупреждение сразу, а не через минуту TTL
+  invalidateKeys(peer?: string): void {
+    if (peer) this.keyCache.delete(peer)
+    else this.keyCache.clear()
+  }
+
+  private async devicesFor(login: string, excludeSelfDevice = true): Promise<DeviceKey[]> {
+    const cached = this.keyCache.get(login)
+    if (cached && Date.now() - cached.at < KEY_TTL_MS) {
+      return this.excludeSelf(cached.devices, login, excludeSelfDevice)
+    }
+    const devices = await this.deps.api.peerKeys(login)
+    this.keyCache.set(login, { at: Date.now(), devices })
+    return this.excludeSelf(devices, login, excludeSelfDevice)
+  }
+
+  private excludeSelf(devices: DeviceKey[], login: string, excludeSelfDevice: boolean): DeviceKey[] {
+    return excludeSelfDevice && login === this.deps.session.login
+      ? devices.filter((d) => d.deviceId !== this.deps.session.deviceId)
+      : devices
+  }
+
+  // TOFU: смена ключа известного устройства или новое устройство блокируют
+  // отправку до явного подтверждения пользователем
+  private async checkTofu(peers: string[]): Promise<void> {
+    for (const peer of peers) {
+      const devices = await this.devicesFor(peer, peer === this.deps.session.login)
+      if (devices.length === 0) continue
+      const known = await this.deps.keys.known(peer)
+      const existing = await this.deps.keys.get(peer)
+      // блок уже стоит: держим его до явного подтверждения пользователем,
+      // а не до следующего прохода flushOutbox
+      if (existing?.reverifyRequired) {
+        throw new KeyChangedError(peer, existing.pendingDevices ?? [], existing.pendingIsNewDevice ?? false)
+      }
+      const current: Array<[string, Uint8Array]> = devices.map((d) => [d.deviceId, d.pubSpki])
+      const result = await tofuVerdict(known, current)
+      if (result.kind === 'changed') {
+        await this.deps.keys.remember(peer, current, {
+          reverifyRequired: true,
+          pendingDevices: result.devices,
+          pendingIsNewDevice: false,
+        })
+        throw new KeyChangedError(peer, result.devices, false)
+      }
+      if (result.kind === 'newDevice') {
+        await this.deps.keys.remember(peer, current, {
+          reverifyRequired: true,
+          pendingDevices: result.devices,
+          pendingIsNewDevice: true,
+        })
+        throw new KeyChangedError(peer, result.devices, true)
+      }
+      await this.deps.keys.remember(peer, current)
+    }
+  }
+
+  // «отправить всё равно»: пользователь принял новые ключи — снимаем блок
+  async trustPeer(peer: string): Promise<void> {
+    const devices = await this.devicesFor(peer, peer === this.deps.session.login)
+    await this.deps.keys.remember(
+      peer,
+      devices.map((d) => [d.deviceId, d.pubSpki] as [string, Uint8Array]),
+      { verified: false, reverifyRequired: false },
+    )
+    this.invalidateKeys(peer)
+    await this.flushOutbox()
+    this.emit({ type: 'chat', chatId: peer })
+  }
+
+  // ждёт ли чат подтверждения ключей (для баннера в диалоге)
+  async reverifyPending(peer: string): Promise<{ devices: string[]; isNewDevice: boolean } | null> {
+    const known = await this.deps.keys.get(peer)
+    if (!known?.reverifyRequired) return null
+    return { devices: known.pendingDevices ?? [], isNewDevice: known.pendingIsNewDevice === true }
+  }
+
+  // основная отправка: конверт уходит на каждое устройство каждого получателя
+  private async dispatch(chatId: string, content: Uint8Array, options: { sync?: boolean; kind?: 'chat' | 'transfer' } = {}): Promise<void> {
+    const recipients = await this.recipientsOf(chatId)
+    await this.checkTofu(recipients)
+    const batch: BatchRecipient[] = []
+    const missing: string[] = []
+    for (const recipient of recipients) {
+      const devices = await this.devicesFor(recipient)
+      if (devices.length === 0) {
+        // пустой справочник — не «успех»: пользователь не найден/без устройств
+        missing.push(recipient)
+        continue
+      }
+      batch.push({ to: recipient, blobs: await this.deps.session.sealFor(devices, content) })
+    }
+    // 1:1: пустой справочник — «пользователь не найден», это ошибка.
+    // Исключения: группа (недоступный участник пропускается) и чат с самим
+    // собой («Избранное») — там других устройств может не быть вовсе,
+    // запись уже лежит в локальном журнале.
+    const isGroup = (await this.deps.groups.get(chatId)) !== null
+    const isSelfChat = chatId === this.deps.session.login
+    if (missing.length > 0 && !isGroup && !isSelfChat) {
+      throw new RelayError(404, 'not_found', `пользователь не найден: ${missing.join(', ')}`)
+    }
+    for (let i = 0; i < batch.length; i += BATCH_CHUNK) {
+      const chunk = batch.slice(i, i + BATCH_CHUNK)
+      if (chunk.length === 1) {
+        const only = chunk[0]
+        await this.deps.api.send(this.deps.session.token, only.to, options.kind ?? 'chat', only.blobs)
+      } else {
+        const errors = await this.deps.api.sendBatch(this.deps.session.token, options.kind ?? 'chat', chunk)
+        if (errors.size > 0) {
+          const failed = [...errors.keys()].join(', ')
+          throw new RelayError(0, null, `не доставлено: ${failed}`)
+        }
+      }
+    }
+    // копия своего сообщения на свои другие устройства
+    if (options.sync !== false && chatId !== this.deps.session.login) {
+      const own = await this.devicesFor(this.deps.session.login)
+      if (own.length > 0) {
+        const syncPayload = SyncFormat.encode(chatId, content)
+        await this.deps.api.send(
+          this.deps.session.token,
+          this.deps.session.login,
+          'chat',
+          await this.deps.session.sealFor(own, syncPayload),
+        )
+      }
+    }
+  }
+
+  // контент сообщения: сначала в журнал и outbox, потом в сеть — обрыв не теряет текст
+  private async sendWithJournal(chatId: string, content: Uint8Array, options: { sync?: boolean } = {}): Promise<void> {
+    await this.deps.journal.append(chatId, {
+      from: this.deps.session.login,
+      timestamp: Date.now(),
+      content,
+    })
+    await this.sendEvent(chatId, content, options)
+  }
+
+  // служебное событие (правка/удаление/закреп): в журнал НЕ пишется —
+  // иначе автор видел бы пузыри «сообщение не поддерживается»
+  private async sendEvent(chatId: string, content: Uint8Array, options: { sync?: boolean } = {}): Promise<void> {
+    const pendingId = await refOf(content)
+    const entry: Omit<PendingSend, 'attempts'> = {
+      id: pendingId,
+      chatId,
+      recipients: await this.recipientsOf(chatId),
+      kind: 'chat',
+      contentB64: Outbox.pack(content),
+      sync: options.sync !== false,
+      localRecord: false,
+      createdAt: Date.now(),
+    }
+    await this.outbox.enqueue(entry)
+    this.emit({ type: 'chat', chatId })
+    try {
+      await this.dispatch(chatId, content, { sync: options.sync })
+      for (const item of await this.outbox.all()) {
+        if (item.id === pendingId) await this.outbox.remove(item.key)
+      }
+    } catch (error) {
+      if (error instanceof KeyChangedError) {
+        this.emit({ type: 'keys-changed', peer: error.peer, devices: error.devices, isNewDevice: error.isNewDevice })
+        throw error
+      }
+      if (isPermanent(error)) {
+        // 4xx: повтор не поможет — помечаем «не отправлено» и сообщаем UI
+        for (const item of await this.outbox.all()) {
+          if (item.id === pendingId) await this.outbox.markFailed(item.key, (error as Error).message)
+        }
+        this.emit({ type: 'error', message: (error as Error).message })
+        throw error
+      }
+      // сеть/5xx доиграет flushOutbox: сообщение уже в журнале
+    }
+  }
+
+  async flushOutbox(): Promise<void> {
+    // два параллельных прохода (таймер + online + start) слали бы одно и то же
+    if (this.flushing) return
+    this.flushing = true
+    try {
+      for (const entry of await this.outbox.all()) {
+        // постоянные ошибки ждут действия пользователя, а не ретраятся вечно
+        if (entry.failed) continue
+        // backoff между попытками: сеть не должна долбить сервер каждые 15 с
+        if (entry.attempts > 0 && entry.lastAttemptAt) {
+          const delay = Math.min(60_000, 1_000 * 2 ** Math.min(entry.attempts, 6))
+          if (Date.now() - entry.lastAttemptAt < delay) continue
+        }
+        try {
+          const content = await this.outbox.contentOf(entry)
+          await this.dispatch(entry.chatId, content, { sync: entry.sync, kind: entry.kind })
+          await this.outbox.remove(entry.key)
+        } catch (error) {
+          if (error instanceof KeyChangedError) {
+            this.emit({ type: 'keys-changed', peer: error.peer, devices: error.devices, isNewDevice: error.isNewDevice })
+            await this.outbox.bump(entry.key, (error as Error).message)
+            continue
+          }
+          if (isPermanent(error)) await this.outbox.markFailed(entry.key, (error as Error).message)
+          else await this.outbox.bump(entry.key, (error as Error).message)
+        }
+      }
+    } finally {
+      this.flushing = false
+    }
+  }
+
+  // ошибки outbox для UI: что не ушло и почему
+  async failedSends(): Promise<Array<PendingSend & { key: string }>> {
+    return (await this.outbox.all()).filter((entry) => entry.failed)
+  }
+
+  async retrySend(key: string): Promise<void> {
+    await this.outbox.retry(key)
+    await this.flushOutbox()
+  }
+
+  async dropSend(key: string): Promise<void> {
+    await this.outbox.remove(key)
+  }
+
+  async sendText(chatId: string, value: string, options: { replyTo?: { ref: string; author: string; quote: string; ts: number }; silent?: boolean } = {}): Promise<void> {
+    if (!validChatId(chatId)) throw new Error(`некорректный чат: ${chatId}`)
+    // молчаливая обрезка теряла текст: лучше отказать и показать ошибку
+    if (value.length > 4096) throw new Error('сообщение длиннее 4096 символов')
+    const trimmed = value
+    if (!trimmed) return
+    let content: Uint8Array
+    if (options.replyTo) {
+      content = ReplyFormat.encode(
+        options.replyTo.author,
+        options.replyTo.quote,
+        options.replyTo.ref,
+        options.replyTo.ts,
+        trimmed,
+        options.silent === true,
+      )
+    } else if (options.silent) {
+      content = ReplyFormat.encodeSilent(trimmed)
+    } else {
+      content = Env.escapeText(trimmed)
+    }
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, content))
+  }
+
+  // групповой конверт несёт определение группы в каждом сообщении
+  private async wrapGroup(chatId: string, inner: Uint8Array): Promise<Uint8Array> {
+    const group = await this.deps.groups.get(chatId)
+    if (!group) return inner
+    return GroupFormat.encode(group, inner)
+  }
+
+  async sendMedia(chatId: string, info: MediaInfo, options: { silent?: boolean } = {}): Promise<void> {
+    const withFlags = { ...info, silent: options.silent ?? info.silent }
+    const content = await this.wrapGroup(chatId, MediaJson.message(withFlags))
+    await this.sendWithJournal(chatId, content)
+  }
+
+  async sendGeo(chatId: string, lat: number, lng: number): Promise<void> {
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, GeoFormat.encode(lat, lng)))
+  }
+
+  async sendContact(chatId: string, login: string, name?: string): Promise<void> {
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, ContactFormat.encode(login, name)))
+  }
+
+  async sendPoll(chatId: string, question: string, options: string[], anonymous: boolean, correctIndex = -1, explanation?: string, multi = false): Promise<void> {
+    const content = PollFormat.encode(question, options, anonymous, correctIndex, explanation, multi)
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, content))
+  }
+
+  async react(chatId: string, target: { ref?: string; ts?: number }, emoji: string): Promise<void> {
+    const content = ReactionFormat.encode({ ref: target.ref, ts: target.ts }, emoji)
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, content))
+  }
+
+  async vote(chatId: string, pollRef: string, choice: number, remove = false): Promise<void> {
+    const content = remove ? VoteFormat.encode(pollRef, -1, true) : VoteFormat.encode(pollRef, choice)
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, content))
+  }
+
+  // правка: конверт TYPE_EDIT уходит собеседникам, локально применяется сразу
+  async editMessage(chatId: string, target: MessageRecord, newText: string): Promise<void> {
+    if (newText.length > 4096) throw new Error('сообщение длиннее 4096 символов')
+    const newContent = await this.wrapGroup(chatId, Env.encodeBytes(Env.TYPE_EDITED, new TextEncoder().encode(newText)))
+    const event = EditFormat.encode(await refOf(target.content), target.timestamp, newContent, target.content)
+    await this.sendEvent(chatId, await this.wrapGroup(chatId, event))
+    await applyEdit(this.deps.journal, chatId, this.deps.session.login, {
+      targetRef: await refOf(target.content),
+      targetTs: target.timestamp,
+      newContent,
+    })
+    this.emit({ type: 'chat', chatId })
+  }
+
+  async deleteMessage(chatId: string, target: MessageRecord): Promise<void> {
+    const event = DeleteFormat.encode(await refOf(target.content), target.timestamp)
+    await this.sendEvent(chatId, await this.wrapGroup(chatId, event))
+    await applyDelete(this.deps.journal, chatId, this.deps.session.login, {
+      targetRef: await refOf(target.content),
+      targetTs: target.timestamp,
+    })
+    this.emit({ type: 'chat', chatId })
+  }
+
+  async pinMessage(chatId: string, target: MessageRecord, pinned: boolean): Promise<void> {
+    const ref = await refOf(target.content)
+    const event = PinFormat.encode(ref, target.timestamp, pinned)
+    await this.sendEvent(chatId, await this.wrapGroup(chatId, event))
+    const refs = await this.deps.pins.get(chatId)
+    await this.deps.pins.set(chatId, pinned ? [...new Set([...refs, ref])] : refs.filter((r) => r !== ref))
+    this.emit({ type: 'chat', chatId })
+  }
+
+  // ─── звонки ────────────────────────────────────────────────────────────
+
+  // событие звонка уходит собеседнику обычным sealed-блобом; в журнал не
+  // пишется и в outbox не ставится: устаревший offer хуже потерянного
+  async sendCallEvent(peer: string, content: Uint8Array): Promise<void> {
+    // sync:false — иначе свои же устройства получают SDP/ICE как TYPE_SYNC
+    // и записывают их в журнал как обычные сообщения
+    await this.dispatch(peer, content, { sync: false })
+  }
+
+  // запись о завершённом звонке в локальный журнал звонков
+  async logCall(entry: CallLogEntry): Promise<void> {
+    await this.deps.callLog.add(entry)
+    this.emit({ type: 'chat', chatId: entry.peer })
+  }
+
+  async callLog(chatId?: string): Promise<CallLogEntry[]> {
+    return chatId ? this.deps.callLog.forChat(chatId) : this.deps.callLog.all()
+  }
+
+  // ─── статусы, набор, профиль ───────────────────────────────────────────
+
+  async sendTyping(chatId: string): Promise<void> {
+    const last = this.typingSent.get(chatId) ?? 0
+    if (Date.now() - last < TYPING_THROTTLE_MS) return
+    this.typingSent.set(chatId, Date.now())
+    await this.deps.api.typing(this.deps.session.token, chatId)
+  }
+
+  isTyping(chatId: string): boolean {
+    const at = this.typingSeen.get(chatId)
+    return at !== undefined && Date.now() - at < 5_000
+  }
+
+  async markRead(chatId: string): Promise<void> {
+    await this.deps.marks.patch(chatId, { readAt: Date.now(), deliveredAt: Date.now() })
+    try {
+      await this.deps.api.confirmRead(this.deps.session.token, chatId)
+    } catch {
+      // прочитано — не критично: повторим при следующем открытии
+    }
+  }
+
+  async setDraft(chatId: string, value: string): Promise<void> {
+    await this.deps.drafts.set(chatId, value)
+    if (chatId === this.deps.session.login) return
+    // черновик синхронизируется на свои устройства (в журнал не пишется)
+    try {
+      const own = await this.devicesFor(this.deps.session.login)
+      if (own.length === 0) return
+      const payload = DraftFormat.encode(chatId, value, Date.now())
+      await this.deps.api.send(
+        this.deps.session.token,
+        this.deps.session.login,
+        'chat',
+        await this.deps.session.sealFor(own, payload),
+      )
+    } catch {
+      // синк черновика не критичен
+    }
+  }
+
+  async setBio(value: string, birthday?: string): Promise<void> {
+    await this.deps.profiles.patch(this.deps.session.login, { bio: value.slice(0, 70), birthday })
+    const payload = BioFormat.encode(value.slice(0, 70), birthday)
+    const own = await this.devicesFor(this.deps.session.login)
+    if (own.length > 0) {
+      await this.deps.api.send(
+        this.deps.session.token,
+        this.deps.session.login,
+        'chat',
+        await this.deps.session.sealFor(own, payload),
+      )
+    }
+  }
+
+  // Аватары отключены: формат поля ava не согласован с Android, из-за чего
+  // фото уходило как обычное медиа-сообщение во все чаты. См. отчёт
+  // «требует согласования» — вернём, когда формат будет зафиксирован.
+  async setAvatar(_info: MediaInfo, _blobs: Uint8Array): Promise<void> {
+    throw new Error('аватары временно недоступны: формат не согласован с Android')
+  }
+
+  // ─── группы ────────────────────────────────────────────────────────────
+
+  async createGroup(name: string, members: string[]): Promise<string> {
+    const id = `grp_${randomGroupSuffix()}`
+    const info: GroupInfo = {
+      id,
+      name: name.slice(0, 64),
+      members: [...new Set([this.deps.session.login, ...members])].slice(0, 50),
+      rev: 1,
+      desc: '',
+      slowMode: 0,
+      noForward: false,
+      admins: [this.deps.session.login],
+      noReactions: false,
+    }
+    await this.deps.groups.apply(info)
+    // первое сообщение ОБЯЗАНО нести определение группы: иначе получатели
+    // видят запись в личном чате с создателем и не знают о группе
+    await this.sendWithJournal(
+      id,
+      GroupFormat.encode(info, SystemFormat.encodeChange({ sender: this.deps.session.login, added: info.members, removed: [], avatar: false })),
+    )
+    this.emit({ type: 'chat', chatId: id })
+    return id
+  }
+
+  // системная запись об изменении группы: одна, а не «журнал + отправка»
+  private async groupChange(chatId: string, change: Parameters<typeof SystemFormat.encodeChange>[0]): Promise<void> {
+    const group = await this.deps.groups.get(chatId)
+    if (!group) throw new Error('группа неизвестна')
+    await this.sendWithJournal(chatId, await this.wrapGroup(chatId, SystemFormat.encodeChange(change)))
+  }
+
+  async addMembers(chatId: string, logins: string[]): Promise<void> {
+    const group = await this.deps.groups.get(chatId)
+    if (!group) throw new Error('группа неизвестна')
+    const added = logins.filter((l) => !group.members.includes(l))
+    if (added.length === 0) return
+    await this.deps.groups.apply({ ...group, members: [...group.members, ...added].slice(0, 50), rev: group.rev + 1 })
+    await this.groupChange(chatId, { sender: this.deps.session.login, added, removed: [], avatar: false })
+  }
+
+  async removeMember(chatId: string, login: string): Promise<void> {
+    const group = await this.deps.groups.get(chatId)
+    if (!group) throw new Error('группа неизвестна')
+    const members = group.members.filter((m) => m !== login)
+    await this.deps.groups.apply({ ...group, members, rev: group.rev + 1 })
+    await this.groupChange(chatId, { sender: this.deps.session.login, added: [], removed: [login], avatar: false })
+  }
+
+  async renameGroup(chatId: string, name: string): Promise<void> {
+    const group = await this.deps.groups.get(chatId)
+    if (!group) throw new Error('группа неизвестна')
+    await this.deps.groups.apply({ ...group, name: name.slice(0, 64), rev: group.rev + 1 })
+    await this.groupChange(chatId, {
+      sender: this.deps.session.login,
+      added: [],
+      removed: [],
+      renameTo: name.slice(0, 64),
+      avatar: false,
+    })
+  }
+
+  async setGroupDescription(chatId: string, desc: string): Promise<void> {
+    const group = await this.deps.groups.get(chatId)
+    if (!group) throw new Error('группа неизвестна')
+    await this.deps.groups.apply({ ...group, desc: desc.slice(0, 255), rev: group.rev + 1 })
+    await this.groupChange(chatId, {
+      sender: this.deps.session.login,
+      added: [],
+      removed: [],
+      descTo: desc.slice(0, 255),
+      avatar: false,
+    })
+  }
+
+  // ─── чтение состояния ──────────────────────────────────────────────────
+
+  async messages(chatId: string, limit = 100): Promise<MessageRecord[]> {
+    return this.deps.journal.history(chatId, limit)
+  }
+
+  // Снимок чата для UI: лента + агрегаты реакций/голосов за ОДИН проход по
+  // журналу. Раньше реакции считались на каждое сообщение (сотни расшифровок).
+  async chatSnapshot(chatId: string, limit = 300): Promise<ChatSnapshot> {
+    const records = await this.deps.journal.history(chatId, Math.min(limit * 4, 2000))
+    const pinnedRefs = await this.deps.pins.get(chatId)
+    const feed = await buildFeed(records, this.deps.session.login, { pinnedRefs })
+    const pollMeta = new Map<string, { options: number; author: string }>()
+    for (const item of feed) {
+      if (item.kind?.kind === 'poll') {
+        pollMeta.set(item.ref, { options: item.kind.poll.options.length, author: item.record.from })
+      }
+    }
+    const reactionEntries = new Map<string, ReactionEntry[]>()
+    const voteEntries = new Map<string, VoteEntry[]>()
+    for (const record of records) {
+      const parsed = parse(record.content, false)
+      if (parsed.kind === 'reaction') {
+        const key = parsed.targetRef ?? `ts:${parsed.targetTs}`
+        const list = reactionEntries.get(key) ?? []
+        list.push({ ts: record.timestamp, author: record.from, emoji: parsed.emoji })
+        reactionEntries.set(key, list)
+      } else if (parsed.kind === 'vote') {
+        const list = voteEntries.get(parsed.vote.targetRef) ?? []
+        list.push({ ts: record.timestamp, author: record.from, choice: parsed.vote.choice, stop: parsed.vote.stop })
+        voteEntries.set(parsed.vote.targetRef, list)
+      }
+    }
+    const reactions = new Map<string, ReactionState>()
+    for (const [key, entries] of reactionEntries) reactions.set(key, aggregateReactions(entries, this.deps.session.login))
+    const polls = new Map<string, PollState>()
+    for (const [ref, entries] of voteEntries) {
+      const meta = pollMeta.get(ref)
+      if (meta) polls.set(ref, aggregateVotes(entries, meta.options, meta.author, this.deps.session.login))
+    }
+    const mark = await this.deps.marks.get(chatId)
+    return {
+      feed,
+      reactions,
+      polls,
+      peerReadAt: mark.peerReadAt ?? 0,
+      peerDeliveredAt: mark.peerDeliveredAt ?? 0,
+    }
+  }
+
+  async chatSummaries(): Promise<ChatSummary[]> {
+    const [chatIds, drafts, profiles, groups, marks] = await Promise.all([
+      this.deps.journal.chatIds(),
+      this.deps.drafts.all(),
+      this.deps.profiles.all(),
+      this.deps.groups.all(),
+      this.deps.marks.all(),
+    ])
+    const groupMap = new Map(groups.map((g) => [g.id, g]))
+    const contacts = await this.deps.contacts.all()
+    const extra = new Set<string>([...groupMap.keys(), this.deps.session.login])
+    const out: ChatSummary[] = []
+    for (const chatId of new Set([...chatIds, ...extra])) {
+      const records = await this.deps.journal.history(chatId, 200)
+      const lastRecord = records[records.length - 1] ?? null
+      const lastKind = lastRecord ? parse(lastRecord.content, false).kind === 'content' ? (parse(lastRecord.content, false) as { content: Kind }).content : null : null
+      const mark = marks.get(chatId)
+      const readAt = mark?.readAt ?? 0
+      // непрочитанные считаем только по «видимым» сообщениям: реакции, голоса,
+      // системные и звонковые записи не должны растить бейдж
+      const unread = records.filter((r) => r.from !== this.deps.session.login && r.timestamp > readAt && isVisibleRecord(r)).length
+      const group = groupMap.get(chatId)
+      out.push({
+        chatId,
+        // имя контакта (из карточки контакта) важнее голого логина
+        title: group?.name ?? contacts.find((c) => c.login === chatId)?.name ?? chatId,
+        isGroup: group !== undefined,
+        group,
+        lastRecord,
+        lastKind,
+        lastTs: lastRecord?.timestamp ?? 0,
+        unread,
+        draft: drafts.get(chatId)?.text ?? '',
+        pinned: await this.deps.pins.get(chatId),
+        typing: this.isTyping(chatId),
+        members: group?.members.length ?? 2,
+        profileBio: profiles.get(chatId)?.bio ?? '',
+      })
+    }
+    // пустые системные чаты (без истории) в списке не нужны, кроме «Избранного»
+    return out
+      .filter((chat) => chat.lastRecord !== null || chat.chatId === this.deps.session.login || chat.draft !== '')
+      .sort((a, b) => b.lastTs - a.lastTs)
+  }
+
+  async reactionsFor(chatId: string, targetRef: string, targetTs: number): Promise<ReturnType<typeof aggregateReactions>> {
+    const records = await this.deps.journal.history(chatId, 500)
+    const entries: ReactionEntry[] = []
+    for (const record of records) {
+      const parsed = parse(record.content, false)
+      if (parsed.kind !== 'reaction') continue
+      const matchesRef = parsed.targetRef !== undefined && parsed.targetRef === targetRef
+      const matchesTs = parsed.targetRef === undefined && parsed.targetTs === targetTs
+      if (matchesRef || matchesTs) entries.push({ ts: record.timestamp, author: record.from, emoji: parsed.emoji })
+    }
+    return aggregateReactions(entries, this.deps.session.login)
+  }
+
+  async votesFor(chatId: string, pollRef: string, options: number, pollAuthor: string): Promise<ReturnType<typeof aggregateVotes>> {
+    const records = await this.deps.journal.history(chatId, 500)
+    const entries: VoteEntry[] = []
+    for (const record of records) {
+      const parsed = parse(record.content, false)
+      if (parsed.kind !== 'vote') continue
+      // сравнение ссылок — префиксное: старые 8-hex ref не равны строго
+      if (!sameRef(parsed.vote.targetRef, pollRef)) continue
+      entries.push({ ts: record.timestamp, author: record.from, choice: parsed.vote.choice, stop: parsed.vote.stop })
+    }
+    return aggregateVotes(entries, options, pollAuthor, this.deps.session.login)
+  }
+
+  // медиа: сервер отдаёт блоб один раз, дальше играем из локального кэша
+  async ensureMedia(info: MediaInfo): Promise<Uint8Array | null> {
+    const cached = await this.deps.media.get(info.id)
+    if (cached) return cached
+    try {
+      const blob = await this.deps.api.downloadMedia(this.deps.session.token, info.id)
+      await this.deps.media.put(info.id, blob)
+      return blob
+    } catch {
+      return null
+    }
+  }
+
+  async uploadMedia(data: Uint8Array, onProgress?: (percent: number) => void): Promise<string> {
+    return this.deps.api.uploadMedia(this.deps.session.token, data, onProgress)
+  }
+
+  async checkOnline(peer: string): Promise<{ online: boolean; lastSeenUnix: number } | null> {
+    try {
+      return await this.deps.api.checkOnline(this.deps.session.token, peer)
+    } catch {
+      return null
+    }
+  }
+}
+
+// постоянная ошибка (4xx, кроме 408/429): повторять бессмысленно
+function isPermanent(error: unknown): boolean {
+  if (!(error instanceof RelayError)) return false
+  if (error.status < 400 || error.status >= 500) return false
+  return error.status !== 408 && error.status !== 429
+}
+
+// «видимая» запись ленты: реакции, голоса и служебные события не считаются
+// ни в непрочитанных, ни в превью списка чатов
+function isVisibleRecord(record: MessageRecord): boolean {
+  const parsed = parse(record.content, false)
+  if (parsed.kind === 'reaction' || parsed.kind === 'vote') return false
+  if (parsed.kind === 'content' && parsed.content.kind === 'system') return false
+  return true
+}
+
+function randomGroupSuffix(): string {
+  const raw = new Uint8Array(8)
+  globalThis.crypto.getRandomValues(raw)
+  return [...raw].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// полезно UI: отпечаток устройства для экрана безопасности
+export async function deviceFingerprint(pub: Uint8Array): Promise<string> {
+  const { toHex } = await import('../util/bytes.js')
+  const { sha256 } = await import('../crypto/primitives.js')
+  return toHex(await sha256(pub)).slice(0, 32)
+}
+
+export type { DeviceKeyPair }

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <!-- CSP: без inline-скриптов и eval. style-src с 'unsafe-inline' — из-за
+         динамических style-атрибутов (позиция меню, градиенты аватаров,
+         полосы waveform); скрипты при этом строго 'self'.
+         connect-src: http: добавлен для dev-релея на 127.0.0.1 (vite proxy).
+         В прод-заголовке Caddy http: из connect-src убирается. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self' https: wss: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#f4f5f8" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#12151c" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="E2E-мессенджер: история сообщений живёт только на устройстве" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Мессенджер</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Мессенджер" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- статичный сплэш: пока AppContext.create() ждёт IndexedDB, страница не пустая -->
+      <div class="splash">
+        <div class="splash-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 2L11 13" />
+            <path d="M22 2l-7 20-4-9-9-4 20-7z" />
+          </svg>
+        </div>
+        <p>Мессенджер</p>
+      </div>
+    </div>
+    <div id="snackbars" class="snackbar-stack" role="status" aria-live="polite"></div>
+    <noscript>Для работы мессенджера нужен JavaScript: криптография выполняется на устройстве.</noscript>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

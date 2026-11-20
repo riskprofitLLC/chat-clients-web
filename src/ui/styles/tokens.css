@@ -1,0 +1,168 @@
+/* Токены дизайна: цвета, шкалы, радиусы, тени, движение.
+   Три темы (auto/light/dark) и шесть акцентов — через data-theme/data-accent. */
+:root {
+  /* шкала отступов 4/8 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+
+  /* радиусы */
+  --r-sm: 12px;
+  --r-md: 16px;
+  --r-lg: 22px;
+  --r-full: 999px;
+
+  /* типографика 12/13/15/17/20/28 */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-2xl: 28px;
+
+  /* движение 120/200/280 мс, единый easing */
+  --t-fast: 120ms;
+  --t-base: 200ms;
+  --t-slow: 280ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  /* светлая тема — палитра Telegram */
+  --bg: #FFFFFF;
+  --bg-elevated: #FFFFFF;
+  --surface: #FFFFFF;
+  --surface-2: #F1F1F3;
+  --surface-3: #E4E6EB;
+  --text: #1A1D21;
+  --text-muted: #63686E;
+  --border: #D9D9D9;
+  --border-strong: #B9BEC4;
+  /* поля ввода: фон поиска/композера, подсказка, иконка (§1) */
+  --field-bg: #F2F4F5;
+  --field-hint: #98A0A7;
+  --field-icon: #A1A8AF;
+  --bubble-theirs: #FFFFFF;
+  --bubble-mine: #EFFFDE;
+  --bubble-mine-text: #1A1D21;
+  --danger: #d92d20;
+  --danger-soft: #fde8e6;
+  --success: #12805c;
+  --warning: #b45309;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.1), 0 2px 4px rgba(16, 24, 40, 0.06);
+  --shadow-lg: 0 18px 48px rgba(16, 24, 40, 0.18), 0 4px 12px rgba(16, 24, 40, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    /* тёмная тема — палитра Telegram */
+    --bg: #0E1621;
+    --bg-elevated: #17212B;
+    --surface: #17212B;
+    --surface-2: #182533;
+    --surface-3: #222E3C;
+    --text: #FFFFFF;
+    --text-muted: #93A3B1;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.16);
+    /* ночь: поле — поверхность, подсказка/иконка — вторичный серый */
+    --field-bg: #17212B;
+    --field-hint: #93A3B1;
+    --field-icon: #93A3B1;
+    --bubble-theirs: #182533;
+    --bubble-mine: #2B5278;
+    --bubble-mine-text: #FFFFFF;
+    --danger: #f97066;
+    --danger-soft: #3a1f1e;
+    --success: #3ecf8e;
+    --warning: #f5b544;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 20px 52px rgba(0, 0, 0, 0.55);
+  }
+}
+
+:root[data-theme='dark'] {
+  /* тёмная тема — палитра Telegram */
+  --bg: #0E1621;
+  --bg-elevated: #17212B;
+  --surface: #17212B;
+  --surface-2: #182533;
+  --surface-3: #222E3C;
+  --text: #FFFFFF;
+  --text-muted: #93A3B1;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  /* ночь: поле — поверхность, подсказка/иконка — вторичный серый */
+  --field-bg: #17212B;
+  --field-hint: #93A3B1;
+  --field-icon: #93A3B1;
+  --bubble-theirs: #182533;
+  --bubble-mine: #2B5278;
+  --bubble-mine-text: #FFFFFF;
+  --danger: #f97066;
+  --danger-soft: #3a1f1e;
+  --success: #3ecf8e;
+  --warning: #f5b544;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 20px 52px rgba(0, 0, 0, 0.55);
+}
+
+/* акценты: --accent и производные; текст на акценте всегда контрастный */
+:root,
+:root[data-accent='blue'] {
+  /* акцент по умолчанию — телеграм-синий */
+  --accent: #0F6FBF;
+  --accent-strong: #0B5AA5;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='teal'] {
+  --accent: #0f9b8e;
+  --accent-strong: #0b7c72;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='violet'] {
+  --accent: #7c4dff;
+  --accent-strong: #6234e0;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='rose'] {
+  --accent: #e0447c;
+  --accent-strong: #c22e64;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='amber'] {
+  --accent: #c47f10;
+  --accent-strong: #a2670a;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+:root[data-accent='green'] {
+  --accent: #2f9e44;
+  --accent-strong: #237a34;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-text: #ffffff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 0ms;
+    --t-base: 0ms;
+    --t-slow: 0ms;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

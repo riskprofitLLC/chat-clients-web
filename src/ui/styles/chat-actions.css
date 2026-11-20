@@ -1,0 +1,123 @@
+/* Раунд 2: ряд историй, архив, действия строки списка и просмотрщик историй. */
+
+/* ─── ряд историй ──────────────────────────────────────────────────────── */
+.story-strip {
+  display: flex;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.story-add,
+.story-circle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  background: transparent;
+  border: none;
+  padding: 0;
+  flex: none;
+}
+
+.story-add {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--r-full);
+  border: 1px dashed var(--border-strong);
+  color: var(--accent);
+  justify-content: center;
+}
+
+.story-circle .avatar {
+  /* кольцо вокруг автора истории — акцентное, как в TG */
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.story-name {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  max-width: 64px;
+  overflow: clip;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── архив ────────────────────────────────────────────────────────────── */
+.archive-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) var(--sp-4) 0;
+  padding: var(--sp-1) var(--sp-3);
+  align-self: flex-start;
+  background: var(--surface-2);
+  border: none;
+  border-radius: var(--r-full);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+/* ─── бейдж-точка «непрочитано вручную» ────────────────────────────────── */
+.badge.dot {
+  min-width: 10px;
+  width: 10px;
+  height: 10px;
+  padding: 0;
+}
+
+/* «без звука» у времени строки */
+.chat-mute {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex: none;
+}
+
+/* ─── просмотрщик историй ──────────────────────────────────────────────── */
+.story-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  align-items: center;
+}
+
+.story-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+}
+
+.story-author {
+  font-weight: 600;
+}
+
+.story-left {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.story-photo {
+  width: 100%;
+  max-width: 320px;
+  border-radius: var(--r-md);
+  background: var(--surface-3);
+}
+
+.story-caption {
+  text-align: center;
+  color: var(--text);
+}
+
+.story-nav {
+  display: flex;
+  gap: var(--sp-4);
+}
+
+/* опасный пункт меню строки — тот же красный, что и в диалоге */
+.menu-item.danger {
+  color: var(--danger);
+}

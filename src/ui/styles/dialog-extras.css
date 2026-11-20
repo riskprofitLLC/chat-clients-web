@@ -1,0 +1,82 @@
+/* Дополнения диалога: мультивыбор сообщений (P-W7), мета пересылки (P-W6),
+   панель массовых действий. Файл был заглушкой — наполнен в рамках волны B. */
+
+/* ─── режим выделения ──────────────────────────────────────────────────── */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.selection-count {
+  flex: 1;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.selection-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.selection-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+/* галка выделения на пузыре: скрыта вне режима выбора */
+.msg-check {
+  display: none;
+  position: absolute;
+  top: 50%;
+  left: -6px;
+  transform: translate(-100%, -50%);
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-full);
+  border: 2px solid var(--border);
+  background: var(--surface);
+  color: transparent;
+}
+
+.message.selecting .msg-check {
+  display: inline-flex;
+}
+
+.message.mine.selecting .msg-check {
+  left: auto;
+  right: -6px;
+}
+
+.message.selected .msg-check {
+  border-color: var(--accent, #3b82f6);
+  background: var(--accent, #3b82f6);
+  /* галочка внутри круга — белой обводкой (currentColor иконки) */
+  color: #ffffff;
+}
+
+.message.selected .bubble {
+  box-shadow: 0 0 0 2px var(--accent, #3b82f6);
+}
+
+.message.selecting {
+  cursor: pointer;
+}
+
+/* ─── мета пересылки (P-W6) ────────────────────────────────────────────── */
+.forwarded-from {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-1);
+  font-size: var(--fs-xs);
+  font-style: italic;
+  color: var(--text-muted);
+}

@@ -1,0 +1,71 @@
+/* Экран блокировки приложения PIN-кодом (P-W5): полноэкранный слой поверх
+   интерфейса — выше оверлея звонка и сканера QR, поэтому PIN не обходится. */
+.app-lock {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background:
+    radial-gradient(900px 500px at 20% 0%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 60%),
+    var(--bg);
+}
+
+.app-lock-card {
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  text-align: center;
+}
+
+.app-lock-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border-radius: var(--r-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.app-lock-title {
+  font-size: var(--fs-xl);
+  font-weight: 700;
+}
+
+.app-lock-input {
+  width: 100%;
+  text-align: center;
+  font-size: var(--fs-2xl);
+  letter-spacing: 0.4em;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--field-bg);
+  color: var(--text);
+}
+
+.app-lock-input:disabled {
+  opacity: 0.6;
+}
+
+.app-lock-error {
+  color: var(--danger);
+  font-size: var(--fs-sm);
+}
+
+.app-lock-countdown {
+  color: var(--danger);
+  font-size: var(--fs-md);
+  font-variant-numeric: tabular-nums;
+}
+
+.app-lock-card .btn.block {
+  margin-top: var(--sp-2);
+}
